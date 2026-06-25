@@ -9,6 +9,7 @@ import html
 from typing import Dict, List, Optional
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 import httpx
 from dotenv import load_dotenv
 
@@ -35,6 +36,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Gzip compression for API responses
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 # JioSaavn API Endpoint
 JIOSAAVN_API_URL = "https://saavn.sumit.co/api"
@@ -153,21 +157,33 @@ def parse_jiosaavn_song(item: dict) -> dict:
         if not thumbnail and images:
             thumbnail = images[-1].get("url")
             
-    # Extract audio stream link (prefer 320kbps, fallback to 160kbps, then last in list)
+    # Extract audio stream link (prefer 160kbps for data savings, fallback to 96kbps, then 320kbps, then last in list)
     download_urls = item.get("downloadUrl", [])
     audio_url = ""
     if isinstance(download_urls, list):
         for dl in download_urls:
-            if dl.get("quality") == "320kbps":
+            if dl.get("quality") == "160kbps":
                 audio_url = dl.get("url")
                 break
         if not audio_url:
             for dl in download_urls:
-                if dl.get("quality") == "160kbps":
+                if dl.get("quality") == "96kbps":
+                    audio_url = dl.get("url")
+                    break
+        if not audio_url:
+            for dl in download_urls:
+                if dl.get("quality") == "320kbps":
                     audio_url = dl.get("url")
                     break
         if not audio_url and download_urls:
             audio_url = download_urls[-1].get("url")
+
+    # Compile a dictionary of all available stream qualities
+    streams = {}
+    if isinstance(download_urls, list):
+        for dl in download_urls:
+            if isinstance(dl, dict) and dl.get("quality") and dl.get("url"):
+                streams[dl.get("quality")] = dl.get("url")
             
     # Extract artist names from primary / all artists
     artists_list = item.get("artists", {}).get("primary", []) if isinstance(item.get("artists"), dict) else []
@@ -189,6 +205,7 @@ def parse_jiosaavn_song(item: dict) -> dict:
         "artist": html.unescape(artist_names),
         "thumbnail": thumbnail,
         "audioUrl": audio_url,
+        "streams": streams,
         "album": html.unescape(album_name),
         "duration": int(item.get("duration", 180) or 180)
     }
