@@ -47,6 +47,10 @@ JIOSAAVN_API_URL = "https://saavn.sumit.co/api"
 cache: Dict[str, dict] = {}
 CACHE_EXPIRY = datetime.timedelta(minutes=30)
 
+# In-memory cache for search results
+search_cache: Dict[str, dict] = {}
+SEARCH_CACHE_EXPIRY = datetime.timedelta(minutes=15)
+
 # Static High-Fidelity Fallback Data in case the API encounters errors
 FALLBACK_DATA: Dict[str, List[dict]] = {
     "Telugu": [
@@ -146,14 +150,18 @@ def parse_jiosaavn_song(item: dict) -> dict:
     """
     song_id = item.get("id")
     
-    # Extract thumbnail (prefer 500x500, fallback to last in list)
+    # Extract thumbnails (extract all sizes into a dictionary)
     images = item.get("image", [])
+    thumbnails = {}
     thumbnail = ""
     if isinstance(images, list):
         for img in images:
-            if img.get("quality") == "500x500":
-                thumbnail = img.get("url")
-                break
+            if isinstance(img, dict) and img.get("quality") and img.get("url"):
+                thumbnails[img.get("quality")] = img.get("url")
+        # Prefer 150x150 for list thumbnails (saves ~10x data vs 500x500)
+        thumbnail = thumbnails.get("150x150", "")
+        if not thumbnail:
+            thumbnail = thumbnails.get("500x500", "")
         if not thumbnail and images:
             thumbnail = images[-1].get("url")
             
@@ -183,7 +191,13 @@ def parse_jiosaavn_song(item: dict) -> dict:
     if isinstance(download_urls, list):
         for dl in download_urls:
             if isinstance(dl, dict) and dl.get("quality") and dl.get("url"):
-                streams[dl.get("quality")] = dl.get("url")
+                q = dl.get("quality")
+                u = dl.get("url")
+                streams[q] = u
+                if q == "48kbps":
+                    streams["64kbps"] = u
+                elif q == "64kbps":
+                    streams["48kbps"] = u
             
     # Extract artist names from primary / all artists
     artists_list = item.get("artists", {}).get("primary", []) if isinstance(item.get("artists"), dict) else []
@@ -204,6 +218,7 @@ def parse_jiosaavn_song(item: dict) -> dict:
         "title": html.unescape(item.get("name", "Unknown Song")),
         "artist": html.unescape(artist_names),
         "thumbnail": thumbnail,
+        "thumbnails": thumbnails,
         "audioUrl": audio_url,
         "streams": streams,
         "album": html.unescape(album_name),
@@ -325,18 +340,31 @@ async def get_trending(languages: str = Query(..., description="Comma-separated 
 @app.get("/api/search")
 async def search_songs(
     q: str = Query(..., description="The query string to search for"),
-    languages: Optional[str] = Query(None, description="Comma-separated list of preferred languages")
+    languages: Optional[str] = Query(None, description="Comma-separated list of preferred languages"),
+    limit: int = Query(10, ge=1, le=50, description="Maximum number of search results to return")
 ):
     """
     Searches JioSaavn library for songs matching the query q, with language filters applied.
+    Caches search results for 15 minutes to save bandwidth and API limits.
     """
     if not q or not q.strip():
         raise HTTPException(status_code=400, detail="Search query is required")
 
     query = q.strip()
-    logger.info(f"Search request for: '{query}' with preferred languages: '{languages}'")
+    
+    # Check search cache first
+    cache_key = f"{query.lower()}:{languages.strip().lower() if languages else ''}:{limit}"
+    now = datetime.datetime.now()
+    if cache_key in search_cache:
+        entry = search_cache[cache_key]
+        if now - entry["timestamp"] < SEARCH_CACHE_EXPIRY:
+            logger.info(f"Serving cached search results for: '{cache_key}'")
+            return entry["data"]
+
+    logger.info(f"Search request for: '{query}' with preferred languages: '{languages}' and limit: {limit}")
 
     # If preferred languages are specified, refine the query to yield better results
+    refined_query = query
     if languages:
         requested_langs = [lang.strip() for lang in languages.split(",") if lang.strip()]
         if requested_langs:
@@ -344,10 +372,10 @@ async def search_songs(
             if not any(l.lower() in query_lower for l in requested_langs):
                 # Append languages to the search query to bias the search
                 lang_filter = " ".join(requested_langs)
-                query = f"{query} {lang_filter}"
-                logger.info(f"Refined search query: '{query}'")
+                refined_query = f"{query} {lang_filter}"
+                logger.info(f"Refined search query: '{refined_query}'")
 
-    songs = await fetch_jiosaavn_songs(query, limit=15)
+    songs = await fetch_jiosaavn_songs(refined_query, limit=limit)
     
     if not songs:
         # Return fallback search results from static list
@@ -359,12 +387,20 @@ async def search_songs(
                 if query_lower in song["title"].lower() or query_lower in song["artist"].lower():
                     matches.append(song)
         if matches:
-            return ensure_compatibility(matches[:10])
-            
-        # Global ultimate fallback
-        return ensure_compatibility(FALLBACK_DATA.get("English", []))
+            compat_songs = ensure_compatibility(matches[:limit])
+        else:
+            # Global ultimate fallback
+            compat_songs = ensure_compatibility(FALLBACK_DATA.get("English", []))
+    else:
+        compat_songs = ensure_compatibility(songs)
         
-    return ensure_compatibility(songs)
+    # Store in search cache
+    search_cache[cache_key] = {
+        "timestamp": now,
+        "data": compat_songs
+    }
+    
+    return compat_songs
 
 # ==========================================
 # Mood Mix API Feature
@@ -878,26 +914,29 @@ async def get_spotify_tracks(playlist_id: str, token: str) -> List[dict]:
     headers = {
         "Authorization": f"Bearer {token}"
     }
-    url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks"
+    url = f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks?limit=100"
+    tracks = []
     async with httpx.AsyncClient() as client:
-        response = await client.get(url, headers=headers)
-        if response.status_code == 200:
-            items = response.json().get("items", [])
-            tracks = []
-            for item in items:
-                track = item.get("track")
-                if not track:
-                    continue
-                name = track.get("name")
-                artists = [a.get("name") for a in track.get("artists", [])]
-                artist_str = ", ".join(artists) if artists else "Unknown Artist"
-                tracks.append({
-                    "name": name,
-                    "artist": artist_str
-                })
-            return tracks
-        else:
-            raise Exception(f"Failed to fetch Spotify tracks: {response.text}")
+        while url and len(tracks) < 500:
+            response = await client.get(url, headers=headers)
+            if response.status_code == 200:
+                data = response.json()
+                items = data.get("items", [])
+                for item in items:
+                    track = item.get("track")
+                    if not track:
+                        continue
+                    name = track.get("name")
+                    artists = [a.get("name") for a in track.get("artists", [])]
+                    artist_str = ", ".join(artists) if artists else "Unknown Artist"
+                    tracks.append({
+                        "name": name,
+                        "artist": artist_str
+                    })
+                url = data.get("next")
+            else:
+                raise Exception(f"Failed to fetch Spotify tracks: {response.text}")
+        return tracks
 
 async def scrape_spotify_playlist_fallback(playlist_id: str) -> dict:
     url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
@@ -1059,13 +1098,31 @@ async def import_spotify_playlist(
             )
             
     try:
-        # Limit to 50 tracks
-        spotify_tracks = spotify_tracks[:50]
+        # Increase the limit to 500 tracks
+        spotify_tracks = spotify_tracks[:500]
         
-        resolved_tracks = []
-        for track in spotify_tracks:
-            resolved = await resolve_jiosaavn_track(track["name"], track["artist"])
-            resolved_tracks.append(resolved)
+        # Concurrently resolve tracks on JioSaavn with a semaphore to prevent timeouts
+        import asyncio
+        sem = asyncio.Semaphore(15)
+        
+        async def resolve_with_sem(t):
+            async with sem:
+                try:
+                    return await resolve_jiosaavn_track(t["name"], t["artist"])
+                except Exception as e:
+                    logger.error(f"Error resolving track {t.get('name')}: {e}")
+                    return {
+                        "id": f"dummy_{hash(t.get('name', ''))}",
+                        "title": t.get("name", "Unknown Track"),
+                        "artist": t.get("artist", "Unknown Artist"),
+                        "thumbnail": "https://images.unsplash.com/photo-1614613535308-eb5fbd3d2c17?w=500&q=80",
+                        "audioUrl": "",
+                        "album": "Imported Single",
+                        "duration": 180
+                    }
+                    
+        tasks = [resolve_with_sem(track) for track in spotify_tracks]
+        resolved_tracks = await asyncio.gather(*tasks)
             
         logger.info(f"Import successful! '{meta['name']}' has {len(resolved_tracks)} tracks.")
         return {
